@@ -206,11 +206,11 @@ def _is_blocked_path(url: str) -> bool:
     discovery methods — newspaper4k happily returns video pages, which have no
     body text and waste the article budget."""
     path = urlparse(url).path.lower()
-    blocked = ("/tag/", "/tags/", "/category/", "/author/", "/search",
-               "/login", "/signin", "/subscribe", "/newsletter", "/video/",
-               "/videos/", "/audio/", "/podcast", "/gallery/", "/photos/",
-               "/live/", "/contact", "/about", "/privacy", "/terms",
-               "/rss", "/feed")
+    blocked = ("/tag/", "/tags/", "/topico/", "/topic/", "/category/",
+               "/author/", "/search", "/login", "/signin", "/subscribe",
+               "/newsletter", "/video/", "/videos/", "/audio/", "/podcast",
+               "/gallery/", "/photos/", "/live/", "/contact", "/about",
+               "/privacy", "/terms", "/rss", "/feed")
     if any(b in path for b in blocked):
         return True
     return path.endswith((".jpg", ".png", ".gif", ".pdf", ".xml", ".css", ".js"))
@@ -225,18 +225,33 @@ def _looks_like_article(url: str) -> bool:
         return False
     if _is_blocked_path(url):
         return False
-    last = path.rstrip("/").rsplit("/", 1)[-1]
     # Date in the path (e.g. /2026/07/01/...) is a strong article signal.
     if re.search(r"/20\d{2}/", path):
         return True
-    # A long hyphenated slug ("prime-minister-resigns-over-scandal") or an
-    # .html page usually is one. Short two-word slugs ("love-and-sex",
-    # "world-cup-2026") are almost always section indexes, so require either
-    # several hyphens or some length.
+    segments = [s for s in path.rstrip("/").split("/") if s]
+    if not segments:
+        return False
+    last = segments[-1]
     if last.endswith((".html", ".htm", ".shtml")):
         return True
-    hyphens = last.count("-")
-    return hyphens >= 3 or (hyphens >= 2 and len(last) >= 25)
+
+    def _is_slug(seg: str) -> bool:
+        # A long hyphenated slug ("prime-minister-resigns-over-scandal"). Short
+        # two-word slugs ("love-and-sex") are usually section indexes, so require
+        # several hyphens or some length.
+        hyphens = seg.count("-")
+        return hyphens >= 3 or (hyphens >= 2 and len(seg) >= 25)
+
+    # Many sites end an article URL with a numeric id (e.g.
+    # /mundo/artigo/<slug>/18102236); the descriptive slug is then the segment
+    # BEFORE the id, so test the last two segments, not just the last.
+    if any(_is_slug(seg) for seg in segments[-2:]):
+        return True
+    # An explicit article marker (/artigo/, /noticia/) ending in a numeric id is
+    # an article even when the slug is short (e.g. /opiniao/artigo/eva/12345).
+    if last.isdigit() and any(m in path for m in ("/artigo/", "/noticia/")):
+        return True
+    return False
 
 
 # --- date helper shared by sitemap parsing and article extraction ---------- #
@@ -357,6 +372,20 @@ def _sitemap_in_window(loc: str, start_date: Optional[date],
     if not (start_date and end_date):
         return True
     low = loc.lower()
+    # Date in query params, e.g. '.../sitemap.xml?yyyy=2026&mm=07&dd=02' (jn.pt):
+    # a per-day sitemap index. Prune to the exact day window when dd is present.
+    q = re.search(r"yyyy=(\d{4}).{0,12}?mm=(\d{1,2})(?:.{0,12}?dd=(\d{1,2}))?", low)
+    if q:
+        year, month = int(q.group(1)), int(q.group(2))
+        if q.group(3) and 1 <= month <= 12:
+            try:
+                d = date(year, month, int(q.group(3)))
+                return start_date - _DATE_GRACE <= d <= end_date + _DATE_GRACE
+            except ValueError:
+                pass
+        if 1 <= month <= 12:
+            return (start_date.year, start_date.month) <= (year, month) \
+                   <= (end_date.year, end_date.month)
     ym = re.search(r"(20\d{2})[-_/](\d{1,2})(?!\d)", low)
     if ym:
         year, month = int(ym.group(1)), int(ym.group(2))

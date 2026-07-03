@@ -9,6 +9,7 @@ venv/
 resultados_*.csv
 scraped_articles.csv
 scraped_texts.csv
+arquivo_*.csv
 
 # Local editor / agent settings
 .claude/settings.local.json

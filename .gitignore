@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Scrape output data (regenerable; not source)
+resultados_*.csv
+scraped_articles.csv
+scraped_texts.csv
+
+# Local editor / agent settings
+.claude/settings.local.json
+.claude/worktrees/

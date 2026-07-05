@@ -29,7 +29,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Callable, Optional
-from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.parse import urljoin, urlparse, urldefrag, urlencode
 
 import requests
 import trafilatura
@@ -55,11 +55,60 @@ REQUEST_TIMEOUT = 20  # seconds, for every HTTP request we make
 FETCH_ATTEMPTS = 4
 
 
+# curl error codes for connection/TLS-level rejects where the request never got
+# an HTTP response, so retrying the SAME client is pointless but a DIFFERENT HTTP
+# client may still succeed: 7 couldn't-connect, 35 SSL-connect, 52 empty-reply,
+# 56 recv-error/"connection closed abruptly", 92 HTTP/2 stream. Note 28 (timeout)
+# is deliberately excluded — a timeout is transient and must keep retrying
+# curl_cffi so Cloudflare-protected sites aren't downgraded to a plain client.
+_TLS_REJECT_CODES = {7, 35, 52, 56, 92}
+
+# Hosts whose edge drops curl_cffi's impersonated TLS fingerprint at the
+# connection level (e.g. cmjornal.pt) — but accept an ordinary client. Once we
+# see the reject for a host we skip straight to plain requests for it, so we
+# don't pay a failed handshake on every one of its (possibly thousands of)
+# requests. Shared across worker threads, guarded by a lock.
+_PLAIN_HOSTS: set[str] = set()
+_PLAIN_HOSTS_LOCK = threading.Lock()
+
+
+def _is_tls_reject(exc: Exception) -> bool:
+    """True for a curl_cffi failure that a different client might survive (a
+    connection/TLS reject), False for timeouts and everything else."""
+    return getattr(exc, "code", None) in _TLS_REJECT_CODES
+
+
+def _plain_get(url: str, timeout: int):
+    """GET with the ordinary requests client + our browser UA. Used as a fallback
+    for sites that reject curl_cffi's fingerprint. Returns a response object with
+    the same .status_code/.text/.content/.headers/.raise_for_status() surface, so
+    callers don't care which client produced it."""
+    return requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+
+
 def _browser_get(url: str, timeout: int = REQUEST_TIMEOUT):
     """GET a URL with the browser-impersonating client (curl_cffi) so Cloudflare
     treats us like a real browser. Used for every HTTP call — discovery AND
-    article downloads — so the whole scraper works on protected sites."""
-    return cffi_requests.get(url, impersonate="chrome", timeout=timeout)
+    article downloads — so the whole scraper works on protected sites.
+
+    A few sites do the reverse and drop curl_cffi's TLS fingerprint at the
+    connection level; for those we transparently fall back to plain requests
+    (which they accept) and remember the host so later calls skip curl_cffi.
+    curl_cffi is always tried first for an unseen host, preserving the Cloudflare
+    capability; only a genuine connection/TLS reject (not a timeout) triggers the
+    fallback."""
+    host = urlparse(url).netloc.lower()
+    with _PLAIN_HOSTS_LOCK:
+        plain_only = host in _PLAIN_HOSTS
+    if not plain_only:
+        try:
+            return cffi_requests.get(url, impersonate="chrome", timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_tls_reject(exc):
+                raise                       # timeout/other → let the caller retry
+            with _PLAIN_HOSTS_LOCK:
+                _PLAIN_HOSTS.add(host)
+    return _plain_get(url, timeout)
 
 
 class AdaptiveThrottle:
@@ -127,6 +176,8 @@ class ScrapeConfig:
     # URL substrings (lower-cased) that disqualify a candidate during discovery,
     # e.g. "corrections-and-clarifications". Empty = no extra filtering.
     use_sitemap: bool = True            # enumerate the whole site via its sitemap
+    use_search: bool = False            # also query the site's own search (reaches
+                                        # archives the sitemap's rolling window drops)
     crawl_fallback: bool = True         # BFS-crawl the site when sitemaps are thin
     max_crawl_pages: int = 150          # cap on pages fetched during a crawl
     ignore_accents: bool = True         # match "genero" == "género" == "gênero"
@@ -347,8 +398,11 @@ def _sitemap_seeds(target_url: str) -> list[str]:
                 seeds.append(line.split(":", 1)[1].strip())
     except Exception:  # noqa: BLE001
         pass
+    # "/sitemap" (no extension) is a Cofina-group convention (cmjornal.pt,
+    # sabado.pt…). It's normally declared in robots.txt, but some of those sites
+    # 404 their robots.txt, so we must probe the bare path directly too.
     for path in ("/sitemapindex.xml", "/sitemap_index.xml", "/sitemap.xml",
-                 "/sitemap-index.xml", "/news-sitemap.xml"):
+                 "/sitemap-index.xml", "/news-sitemap.xml", "/sitemap"):
         seeds.append(base + path)
     # De-duplicate while preserving order.
     out, seen = [], set()
@@ -571,6 +625,131 @@ def _discover_via_sitemap(target_url: str, start_date: Optional[date],
     return found
 
 
+# --- on-site search discovery (for archives the sitemap doesn't reach) ------ #
+# Some sites trim their sitemap to a rolling window — cmjornal.pt keeps only
+# ~2 years — so older articles are invisible to sitemap discovery. Their on-site
+# SEARCH, however, indexes the full archive. A search adapter paginates that
+# search for the user's keyword(s) and returns candidate article URLs; run_scrape
+# then fetches and date/keyword-filters them exactly as it does sitemap URLs.
+#
+# Known limits (documented for the user, not bugs): the site search is relevance-
+# ranked and ignores date filters, so we pull the whole result set and let the
+# per-article date filter do the windowing; a few indexed URLs are stale (404)
+# and get skipped on fetch; recall is the search engine's, not an exhaustive body
+# scan; and deep pagination can be rate-limited, so we retry politely.
+
+_SEARCH_PAGE_SIZE = 12          # results per page (cmjornal.pt)
+_SEARCH_MAX_PAGES = 400         # hard safety ceiling (~4800 results)
+_SEARCH_PAGE_DELAY = 0.4        # polite pause between search pages
+
+
+def _search_result_links(html: str, base: str) -> list[str]:
+    """Article URLs (…/detalhe/…) linked from a search results page, deduped and
+    filtered through the same article heuristic used everywhere else."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:  # noqa: BLE001
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in soup.find_all("a", href=True):
+        link, _ = urldefrag(urljoin(base, tag["href"]))
+        if "/detalhe/" not in urlparse(link).path.lower():
+            continue
+        if not _same_domain(link, base) or not _looks_like_article(link):
+            continue
+        if link not in seen:
+            seen.add(link)
+            out.append(link)
+    return out
+
+
+def _fetch_search_page(url: str, tries: int = 3) -> Optional[str]:
+    """GET one search results page, retrying transient failures/timeouts (deep
+    pagination is where the site rate-limits). Returns None once exhausted."""
+    for attempt in range(1, tries + 1):
+        try:
+            resp = _browser_get(url)
+            if resp.status_code == 200:
+                return resp.text
+            if 400 <= resp.status_code < 500 and resp.status_code != 429:
+                return None                 # a permanent client error — stop
+        except Exception:  # noqa: BLE001 — timeout/reset → back off and retry
+            pass
+        if attempt < tries:
+            time.sleep(1.5 * attempt)
+    return None
+
+
+def _cmjornal_search_urls(base: str, keyword: str, notify) -> list[str]:
+    """Paginate cmjornal.pt's /Pesquisa archive search for one keyword and return
+    the article URLs it lists. RangeType=All unlocks the whole archive (the date
+    range is applied later, per-article, because the search ignores it)."""
+    endpoint = f"{base}/Pesquisa"
+    found: list[str] = []
+    seen: set[str] = set()
+    empty_streak = 0
+    for page in range(_SEARCH_MAX_PAGES):
+        first = page * _SEARCH_PAGE_SIZE
+        params = {
+            "SearchRequest.Query": keyword,
+            "SearchRequest.RangeType": "All",       # the whole archive, not 7 days
+            "SearchRequest.Sort": "Relevance",
+            "SearchRequest.FirstPosition": first,
+            "SearchRequest.LastPosition": first + _SEARCH_PAGE_SIZE,
+            "SearchRequest.ContentType": "All",
+        }
+        html = _fetch_search_page(f"{endpoint}?{urlencode(params)}")
+        if html is None:
+            break                           # page failed after retries → stop
+        page_links = _search_result_links(html, base)
+        new = [u for u in page_links if u not in seen]
+        seen.update(page_links)
+        found.extend(new)
+        # The results grid is 12 fresh links per page; the surrounding sidebar
+        # repeats a fixed set. So "no NEW links" (not "no links") signals the end
+        # of results — allow one blank page before giving up, to be safe.
+        if new:
+            empty_streak = 0
+        else:
+            empty_streak += 1
+            if empty_streak >= 2:
+                break
+        notify(0, 0, 0, f"Searching the archive for “{keyword}”… "
+                        f"{len(found)} candidate articles")
+        if _SEARCH_PAGE_DELAY > 0:
+            time.sleep(_SEARCH_PAGE_DELAY)
+    return found
+
+
+# Per-host search adapters, keyed by netloc with any leading "www." removed.
+_SEARCH_ADAPTERS: dict[str, Callable[[str, str, object], list[str]]] = {
+    "cmjornal.pt": _cmjornal_search_urls,
+}
+
+
+def _search_host(target_url: str) -> str:
+    return urlparse(target_url).netloc.lower().removeprefix("www.")
+
+
+def _discover_via_search(config: "ScrapeConfig", notify) -> dict[str, Optional[date]]:
+    """Run the on-site search adapter for the target host (if one exists) over
+    every keyword, returning {article_url: url_date_or_None}. Empty dict when the
+    host has no adapter — the caller reports that to the user."""
+    adapter = _SEARCH_ADAPTERS.get(_search_host(config.target_url))
+    if adapter is None:
+        return {}
+    parts = urlparse(config.target_url)
+    base = f"{parts.scheme}://{parts.netloc}"
+    found: dict[str, Optional[date]] = {}
+    for kw in config.keywords:
+        if not kw.strip():
+            continue
+        for loc in adapter(base, kw.strip(), notify):
+            found.setdefault(loc, _url_date(loc))
+    return found
+
+
 # --- recursive crawl fallback ---------------------------------------------- #
 
 def _discover_via_crawl(target_url: str, max_pages: int, delay: float,
@@ -691,6 +870,24 @@ def discover_article_urls(config: "ScrapeConfig", errors: list[str],
                 add(loc, d)
         except Exception as exc:  # noqa: BLE001 — never let discovery abort a run
             errors.append(f"Sitemap discovery failed: {exc}")
+
+    # 1b. On-site search — reaches the archive older than the sitemap's rolling
+    # window (e.g. cmjornal.pt keeps only ~2 years of sitemaps). Additive to the
+    # sitemap; the date window is applied per-article later since search ignores it.
+    if config.use_search:
+        host = _search_host(target_url)
+        if host in _SEARCH_ADAPTERS:
+            notify(0, 0, 0, "Searching the site's archive…")
+            try:
+                for loc, d in _discover_via_search(config, notify).items():
+                    add(loc, d)
+            except Exception as exc:  # noqa: BLE001 — never let search abort a run
+                errors.append(f"Search discovery failed: {exc}")
+        else:
+            errors.append(
+                f"Search discovery isn't available for {host} yet — it's only "
+                "wired up for sites with a known search endpoint (e.g. cmjornal.pt)."
+            )
 
     # 2. Fresh headlines on the target page itself.
     notify(0, 0, 0, "Scanning the target page for links…")
@@ -891,8 +1088,9 @@ def fetch_html(url: str,
         if throttle is not None:
             throttle.wait()
         try:
-            resp = cffi_requests.get(url, impersonate="chrome",
-                                     timeout=REQUEST_TIMEOUT)
+            # curl_cffi first (Cloudflare), with a plain-requests fallback for
+            # hosts that reject its TLS fingerprint (e.g. cmjornal.pt).
+            resp = _browser_get(url, REQUEST_TIMEOUT)
             code = resp.status_code
             if code == 200:
                 if throttle is not None:

@@ -52,6 +52,11 @@ Your browser opens automatically (usually at `http://localhost:8501`). Then:
 > **auto-slows the request rate** to match — so a run stays complete without you
 > touching "Parallel downloads". Such sites are just slower to finish, by their
 > own choice; that's expected, not an error.
+>
+> A few sites do the **opposite** and reject the browser-impersonating fetcher at
+> the connection level (e.g. cmjornal.pt). The tool detects that reject and
+> transparently **falls back to an ordinary HTTP client** for that host, so those
+> sites work too — no setting to change.
 
 ## How discovery works (whole-site search)
 
@@ -68,6 +73,17 @@ For each run it, in order:
    the sitemap yet.
 3. **Falls back to crawling** (following links from the target page) only when
    a site has no usable sitemap.
+
+> **Reaching archives older than the sitemap.** Some sites only keep a rolling
+> window in their sitemap — cmjornal.pt, for example, keeps roughly the last two
+> years, so older articles can't be found that way. Tick **"Also search the
+> site's archive"** (Discovery settings) to *additionally* query the site's own
+> search box for your keywords, which reaches the full back-catalogue (cmjornal
+> goes back to ~2016). Caveats: the site search is relevance-ranked and can't be
+> date-filtered on the server, so the tool pulls **all** keyword matches and then
+> filters them by your date range locally; a few old indexed links are dead and
+> are skipped; and recall is the site's own search index, not an exhaustive
+> body scan. Currently wired up for **cmjornal.pt**; other hosts show a note.
 
 Then it downloads each candidate article and keeps the ones whose title/body
 matches your keywords and whose publish date is in range. While doing so, if

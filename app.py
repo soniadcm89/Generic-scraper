@@ -77,6 +77,18 @@ with st.sidebar:
              "date range below pre-filters the sitemap so only in-window articles "
              "are downloaded.",
     )
+    use_search = st.checkbox(
+        "Also search the site's archive (for dates older than the sitemap)",
+        value=False,
+        help="Some sites only keep the last couple of years in their sitemap "
+             "(e.g. cmjornal.pt keeps ~2 years), so older articles can't be found "
+             "that way. When on, the tool also queries the site's own search box "
+             "for your keywords to reach the older archive. Notes: the site search "
+             "is relevance-ranked and can't be date-filtered on the server, so the "
+             "tool pulls all matches and filters them by your date range here; some "
+             "old links may be dead and are skipped; recall is the site's search, "
+             "not a full-text scan. Currently available for cmjornal.pt.",
+    )
     crawl_fallback = st.checkbox(
         "Crawl the site if no sitemap is found",
         value=True,
@@ -195,6 +207,7 @@ if run_clicked:
             max_articles=int(max_articles),
             exclude_patterns=exclude_patterns,
             use_sitemap=use_sitemap,
+            use_search=use_search,
             crawl_fallback=crawl_fallback,
             max_crawl_pages=int(max_crawl_pages),
             ignore_accents=ignore_accents,

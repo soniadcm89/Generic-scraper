@@ -188,3 +188,20 @@ exploratory searches; use the batch script for large, final runs.
   dates; enable the undated-articles checkbox to see those matches anyway.
 - **Everything fails to download** — the site may block automated clients;
   try another site or a longer delay.
+
+## License
+
+This project is dual-licensed:
+
+- **Code** (e.g. `scraper.py`, `app.py`, `scrape_batch.py`) — **MIT License**.
+  See [`LICENSE-MIT`](LICENSE-MIT).
+- **Documentation** and other written materials (e.g. this `README.md` and the
+  `.docx` reports) — **Creative Commons Attribution-NonCommercial 4.0
+  International (CC BY-NC 4.0)**. See [`LICENSE-CC-BY-NC-4.0`](LICENSE-CC-BY-NC-4.0).
+
+In short: the code is free to reuse (including commercially) with attribution
+and the MIT notice; the documentation may be shared and adapted for
+**non-commercial** purposes with attribution.
+
+> Note: the scraped article data itself is **not** covered by these licenses —
+> it remains subject to each source site's own copyright and terms of service.
